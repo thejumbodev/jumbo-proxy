@@ -1,180 +1,305 @@
-const express = require('express');
-const fetch = require('node-fetch');
-const cors = require('cors');
-const nacl = require('tweetnacl');
+/**
+ * Strata Discord Proxy — Railway
+ *
+ * Required environment variables on Railway:
+ *   DISCORD_BOT_TOKEN      Bot token from Developer Portal
+ *   DISCORD_CLIENT_ID      Application/client ID
+ *   DISCORD_CLIENT_SECRET  OAuth2 client secret
+ *   DISCORD_REDIRECT_URI   Full URL of this server's /discord/callback endpoint
+ *                          e.g. https://jumbo-proxy-production.up.railway.app/discord/callback
+ *   DISCORD_PUBLIC_KEY     Ed25519 public key (from Developer Portal, for interactions)
+ *   FRONTEND_URL           Your frontend URL, defaults to http://localhost:5173
+ *                          e.g. https://ytstrata.com
+ */
 
-const app = express();
-app.use(cors());
+const express = require('express')
+const cors    = require('cors')
+const fetch   = require('node-fetch')
+const nacl    = require('tweetnacl')
 
-// We need the raw body for Discord's signature verification on /interactions,
-// so capture it before express.json() parses it.
-app.use(express.json({
-  verify: (req, res, buf) => { req.rawBody = buf; }
-}));
+const app  = express()
+const PORT = process.env.PORT || 3000
 
-// In-memory RSVP store: { [cardId]: { [discordUserId]: 'yes' | 'no' } }
-const rsvpStore = {};
+const BOT_TOKEN      = process.env.DISCORD_BOT_TOKEN
+const CLIENT_ID      = process.env.DISCORD_CLIENT_ID
+const CLIENT_SECRET  = process.env.DISCORD_CLIENT_SECRET
+const REDIRECT_URI   = process.env.DISCORD_REDIRECT_URI
+const PUBLIC_KEY     = process.env.DISCORD_PUBLIC_KEY
+const FRONTEND_URL   = process.env.FRONTEND_URL || 'http://localhost:5173'
 
-// ── Discord public key for verifying interaction requests ──
-// Set this in Railway's environment variables (Settings -> Variables -> DISCORD_PUBLIC_KEY)
-// Found on your bot's "General Information" page in the Developer Portal.
-const DISCORD_PUBLIC_KEY = process.env.DISCORD_PUBLIC_KEY;
+// ── In-memory RSVP store ─────────────────────────────────────────────
+// Format: { [cardId]: { [workspaceMemberId]: 'accepted' | 'declined' } }
+// Resets on server restart. For persistent storage, migrate to a DB.
+const rsvpStore = {}
 
-function verifyDiscordRequest(req) {
-  const signature = req.get('X-Signature-Ed25519');
-  const timestamp = req.get('X-Signature-Timestamp');
-  if (!signature || !timestamp || !DISCORD_PUBLIC_KEY) return false;
-  try {
-    return nacl.sign.detached.verify(
-      Buffer.from(timestamp + req.rawBody),
-      Buffer.from(signature, 'hex'),
-      Buffer.from(DISCORD_PUBLIC_KEY, 'hex')
-    );
-  } catch (e) { return false; }
+// ── CORS ─────────────────────────────────────────────────────────────
+app.use(cors({ origin: '*', methods: ['GET', 'POST', 'OPTIONS'] }))
+
+// ── Body parsing ─────────────────────────────────────────────────────
+// /interactions needs the raw body for signature verification.
+// All other routes get JSON-parsed bodies.
+app.use((req, res, next) => {
+  if (req.path === '/interactions') {
+    express.raw({ type: '*/*' })(req, res, next)
+  } else {
+    express.json()(req, res, next)
+  }
+})
+
+// ── Discord API helpers ───────────────────────────────────────────────
+const DISCORD = 'https://discord.com/api/v10'
+
+async function dGet(path) {
+  const r = await fetch(`${DISCORD}${path}`, {
+    headers: { Authorization: `Bot ${BOT_TOKEN}`, 'Content-Type': 'application/json' },
+  })
+  if (!r.ok) {
+    const text = await r.text().catch(() => r.statusText)
+    throw new Error(`Discord ${r.status}: ${text}`)
+  }
+  return r.json()
 }
 
-// ── Send a recording invite DM with an embed + yes/no buttons ──
-app.post('/send-invite', async (req, res) => {
-  const { token, userId, cardId, channelName, title, unixTimestamp } = req.body;
-  if (!token || !userId || !cardId || !title || !unixTimestamp) {
-    return res.status(400).json({ error: 'Missing required fields' });
+async function dPost(path, body) {
+  const r = await fetch(`${DISCORD}${path}`, {
+    method: 'POST',
+    headers: { Authorization: `Bot ${BOT_TOKEN}`, 'Content-Type': 'application/json' },
+    body: JSON.stringify(body),
+  })
+  if (!r.ok) {
+    const text = await r.text().catch(() => r.statusText)
+    throw new Error(`Discord ${r.status}: ${text}`)
   }
-  try {
-    const dmRes = await fetch('https://discord.com/api/v10/users/@me/channels', {
-      method: 'POST',
-      headers: { Authorization: `Bot ${token}`, 'Content-Type': 'application/json' },
-      body: JSON.stringify({ recipient_id: userId })
-    });
-    if (!dmRes.ok) {
-      const err = await dmRes.json();
-      return res.status(dmRes.status).json({ error: err });
-    }
-    const dm = await dmRes.json();
+  return r.json()
+}
 
-    const payload = {
+// ═════════════════════════════════════════════════════════════════════
+// 1. GET /discord/invite-url
+//    Returns the OAuth URL that adds the Strata bot to a server.
+// ═════════════════════════════════════════════════════════════════════
+app.get('/discord/invite-url', (req, res) => {
+  const url =
+    `https://discord.com/api/oauth2/authorize` +
+    `?client_id=${CLIENT_ID}` +
+    `&permissions=8` +
+    `&scope=bot%20applications.commands` +
+    (REDIRECT_URI ? `&redirect_uri=${encodeURIComponent(REDIRECT_URI)}` : '')
+
+  res.json({ url })
+})
+
+// ═════════════════════════════════════════════════════════════════════
+// 2. GET /discord/callback?code=...&guild_id=...
+//    Discord redirects here after the user adds the bot.
+//    We exchange the code (optional — Discord sends guild_id directly)
+//    then redirect back to the frontend with guild_id as a param.
+// ═════════════════════════════════════════════════════════════════════
+app.get('/discord/callback', async (req, res) => {
+  const { code, guild_id } = req.query
+
+  // Exchange the auth code if present (fire-and-forget; we don't use the user token)
+  if (code && CLIENT_SECRET && REDIRECT_URI) {
+    fetch(`${DISCORD}/oauth2/token`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      body: new URLSearchParams({
+        client_id:     CLIENT_ID,
+        client_secret: CLIENT_SECRET,
+        grant_type:    'authorization_code',
+        code,
+        redirect_uri:  REDIRECT_URI,
+      }),
+    }).catch(e => console.error('Token exchange error:', e))
+  }
+
+  const dest = guild_id
+    ? `${FRONTEND_URL}?guild_id=${encodeURIComponent(guild_id)}`
+    : FRONTEND_URL
+
+  res.redirect(dest)
+})
+
+// ═════════════════════════════════════════════════════════════════════
+// 3. GET /discord/members?guildId=X
+//    Uses the server-side bot token. Never exposed to the frontend.
+// ═════════════════════════════════════════════════════════════════════
+app.get('/discord/members', async (req, res) => {
+  const { guildId } = req.query
+  if (!guildId) return res.status(400).json({ error: 'Missing guildId' })
+
+  try {
+    const raw = await dGet(`/guilds/${guildId}/members?limit=100`)
+    const members = raw
+      .filter(m => !m.user?.bot)
+      .map(m => ({
+        id:          m.user.id,
+        username:    m.user.username,
+        displayName: m.nick || m.user.global_name || m.user.username,
+        avatar:      m.user.avatar
+          ? `https://cdn.discordapp.com/avatars/${m.user.id}/${m.user.avatar}.png`
+          : null,
+      }))
+    res.json(members)
+  } catch (e) {
+    console.error('/discord/members error:', e.message)
+    res.status(500).json({ error: e.message })
+  }
+})
+
+// ═════════════════════════════════════════════════════════════════════
+// 4. POST /send-invite
+//    Sends a rich DM invite with Accept/Decline buttons.
+//    Body: { userId, cardId, memberId, channelName, title, unixTimestamp }
+//    Token comes from environment — never from the request body.
+// ═════════════════════════════════════════════════════════════════════
+app.post('/send-invite', async (req, res) => {
+  const { userId, cardId, memberId, channelName, title, unixTimestamp } = req.body
+
+  if (!userId || !cardId) return res.status(400).json({ error: 'Missing userId or cardId' })
+
+  // memberId is the workspace member UUID (used as the RSVP key)
+  const rsvpKey = memberId || userId
+
+  try {
+    // Open (or reuse) a DM channel with this user
+    const dm = await dPost('/users/@me/channels', { recipient_id: userId })
+
+    const fields = []
+    if (unixTimestamp) {
+      fields.push({ name: 'Scheduled for', value: `<t:${unixTimestamp}:F>`, inline: false })
+    }
+
+    await dPost(`/channels/${dm.id}/messages`, {
       embeds: [{
-        title: '🎬 Recording invite',
-        description: `**${title}**${channelName ? `\nChannel: ${channelName}` : ''}`,
+        title:       'Recording Invite',
+        description: `You have been invited to record **${title}**${channelName ? ` on **${channelName}**` : ''}.`,
+        fields,
         color: 0x7c6af7,
-        fields: [
-          { name: 'When', value: `<t:${unixTimestamp}:F>\n(<t:${unixTimestamp}:R>)` }
-        ],
-        footer: { text: 'Tap a button below to RSVP' }
+        footer: { text: 'Strata — Video Production Planning' },
       }],
       components: [{
         type: 1,
         components: [
           {
-            type: 2,
-            style: 3, // green
-            label: 'Yes, I\'m in',
-            custom_id: `rsvp_yes_${cardId}`
+            type: 2, style: 3, label: 'Accept',
+            custom_id: `rsvp:${cardId}:${rsvpKey}:accepted`,
           },
           {
-            type: 2,
-            style: 4, // red
-            label: 'No, can\'t make it',
-            custom_id: `rsvp_no_${cardId}`
-          }
-        ]
-      }]
-    };
+            type: 2, style: 4, label: 'Decline',
+            custom_id: `rsvp:${cardId}:${rsvpKey}:declined`,
+          },
+        ],
+      }],
+    })
 
-    const msgRes = await fetch(`https://discord.com/api/v10/channels/${dm.id}/messages`, {
-      method: 'POST',
-      headers: { Authorization: `Bot ${token}`, 'Content-Type': 'application/json' },
-      body: JSON.stringify(payload)
-    });
-
-    if (!msgRes.ok) {
-      const err = await msgRes.json();
-      return res.status(msgRes.status).json({ error: err });
-    }
-    const msg = await msgRes.json();
-    res.json({ success: true, messageId: msg.id });
+    res.json({ ok: true })
   } catch (e) {
-    res.status(500).json({ error: e.message });
+    console.error('/send-invite error:', e.message)
+    res.status(500).json({ error: e.message })
   }
-});
+})
 
-// ── Discord interaction webhook — fires when someone clicks a button ──
-app.post('/interactions', async (req, res) => {
-  if (!verifyDiscordRequest(req)) {
-    return res.status(401).send('Bad request signature');
-  }
-
-  const interaction = req.body;
-
-  // Discord PING check (required for endpoint verification)
-  if (interaction.type === 1) {
-    return res.json({ type: 1 });
-  }
-
-  // Button click
-  if (interaction.type === 3) {
-    const customId = interaction.data.custom_id; // e.g. rsvp_yes_<cardId>
-    const match = customId.match(/^rsvp_(yes|no)_(.+)$/);
-    if (match) {
-      const [, answer, cardId] = match;
-      const userId = interaction.member?.user?.id || interaction.user?.id;
-      if (userId) {
-        if (!rsvpStore[cardId]) rsvpStore[cardId] = {};
-        rsvpStore[cardId][userId] = answer;
-      }
-
-      // Update the original message to show the response, remove buttons
-      return res.json({
-        type: 7, // UPDATE_MESSAGE
-        data: {
-          embeds: [{
-            ...interaction.message.embeds[0],
-            color: answer === 'yes' ? 0x3ecf8e : 0xf06a6a,
-            footer: { text: answer === 'yes' ? "You're in! See you there." : "Got it, marked as not attending." }
-          }],
-          components: []
-        }
-      });
-    }
-  }
-
-  res.json({ type: 4, data: { content: 'Unrecognized interaction.' } });
-});
-
-// ── Site polls this to pick up RSVP changes ──
-app.get('/rsvp-status', (req, res) => {
-  const cardIds = (req.query.cardIds || '').split(',').filter(Boolean);
-  const result = {};
-  cardIds.forEach(id => { result[id] = rsvpStore[id] || {}; });
-  res.json(result);
-});
-
-// ── Ping everyone who said yes, in the #alerts channel ──
+// ═════════════════════════════════════════════════════════════════════
+// 5. POST /ping-alerts
+//    Posts a message pinging confirmed attendees in an alerts channel.
+//    Body: { channelId, userIds, title }
+//    Token comes from environment.
+// ═════════════════════════════════════════════════════════════════════
 app.post('/ping-alerts', async (req, res) => {
-  const { token, channelId, userIds, title } = req.body;
-  if (!token || !channelId || !userIds || !userIds.length) {
-    return res.status(400).json({ error: 'Missing token, channelId, or userIds' });
-  }
+  const { channelId, userIds, title } = req.body
+
+  if (!channelId) return res.status(400).json({ error: 'Missing channelId' })
+
   try {
-    const mentions = userIds.map(id => `<@${id}>`).join(' ');
-    const msgRes = await fetch(`https://discord.com/api/v10/channels/${channelId}/messages`, {
-      method: 'POST',
-      headers: { Authorization: `Bot ${token}`, 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        content: `📣 ${mentions} — recording for **${title}** is starting now!`,
-        allowed_mentions: { parse: ['users'] }
-      })
-    });
-    if (!msgRes.ok) {
-      const err = await msgRes.json();
-      return res.status(msgRes.status).json({ error: err });
-    }
-    res.json({ success: true });
+    const mentions = (userIds || []).map(id => `<@${id}>`).join(' ')
+    const content  = `Recording for **${title}** is starting soon!${mentions ? ` ${mentions}` : ''}`.trim()
+
+    await dPost(`/channels/${channelId}/messages`, { content })
+    res.json({ ok: true })
   } catch (e) {
-    res.status(500).json({ error: e.message });
+    console.error('/ping-alerts error:', e.message)
+    res.status(500).json({ error: e.message })
   }
-});
+})
 
-app.get('/', (req, res) => res.send('Jumbo proxy running.'));
+// ═════════════════════════════════════════════════════════════════════
+// 6. GET /rsvp-status?cardIds=id1,id2,...
+//    Returns accumulated RSVP responses for the given card IDs.
+//    Response: { [cardId]: { [memberId]: 'accepted' | 'declined' } }
+// ═════════════════════════════════════════════════════════════════════
+app.get('/rsvp-status', (req, res) => {
+  const cardIds = (req.query.cardIds || '').split(',').filter(Boolean)
+  const result  = {}
+  for (const id of cardIds) result[id] = rsvpStore[id] || {}
+  res.json(result)
+})
 
-const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`Proxy running on port ${PORT}`));
+// ═════════════════════════════════════════════════════════════════════
+// 7. POST /interactions
+//    Discord sends button interactions here.
+//    Verifies the Ed25519 signature, stores RSVP, responds to Discord.
+// ═════════════════════════════════════════════════════════════════════
+app.post('/interactions', (req, res) => {
+  const sig       = req.headers['x-signature-ed25519']
+  const timestamp = req.headers['x-signature-timestamp']
+  const rawBody   = req.body  // Buffer (because we used express.raw)
+
+  // Verify signature if public key is configured
+  if (PUBLIC_KEY) {
+    try {
+      const valid = nacl.sign.detached.verify(
+        Buffer.from(timestamp + rawBody),
+        Buffer.from(sig, 'hex'),
+        Buffer.from(PUBLIC_KEY, 'hex')
+      )
+      if (!valid) return res.status(401).json({ error: 'Bad signature' })
+    } catch {
+      return res.status(401).json({ error: 'Signature verification failed' })
+    }
+  }
+
+  let body
+  try {
+    body = JSON.parse(rawBody.toString())
+  } catch {
+    return res.status(400).json({ error: 'Invalid JSON' })
+  }
+
+  // Discord ping
+  if (body.type === 1) return res.json({ type: 1 })
+
+  // Button component interaction
+  if (body.type === 3) {
+    const customId = body.data?.custom_id || ''
+
+    if (customId.startsWith('rsvp:')) {
+      // Format: rsvp:{cardId}:{memberId}:{accepted|declined}
+      const parts = customId.split(':')
+      if (parts.length === 4) {
+        const [, cardId, memberId, response] = parts
+        if (!rsvpStore[cardId]) rsvpStore[cardId] = {}
+        rsvpStore[cardId][memberId] = response
+
+        const message = response === 'accepted'
+          ? 'You are confirmed for this recording!'
+          : 'Got it — you will not be attending this recording.'
+
+        return res.json({
+          type: 4,
+          data: { content: message, flags: 64 },  // 64 = ephemeral (only visible to the user)
+        })
+      }
+    }
+  }
+
+  // Default acknowledge
+  res.json({ type: 1 })
+})
+
+app.listen(PORT, () => {
+  console.log(`Strata proxy running on :${PORT}`)
+  console.log(`  Bot token: ${BOT_TOKEN ? 'set' : 'MISSING'}`)
+  console.log(`  Client ID: ${CLIENT_ID || 'MISSING'}`)
+  console.log(`  Public key: ${PUBLIC_KEY ? 'set' : 'not set'}`)
+  console.log(`  Frontend URL: ${FRONTEND_URL}`)
+})
