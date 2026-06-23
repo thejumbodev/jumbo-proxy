@@ -1,5 +1,5 @@
 {
-  "name": "jumbo-proxy",
+  "name": "strata-proxy",
   "version": "1.0.0",
   "main": "index.js",
   "scripts": {
@@ -10,5 +10,8 @@
     "express": "^4.18.2",
     "node-fetch": "^2.7.0",
     "tweetnacl": "^1.0.3"
+  },
+  "engines": {
+    "node": ">=18"
   }
 }
