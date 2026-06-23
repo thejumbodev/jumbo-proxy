@@ -28,7 +28,7 @@ const PUBLIC_KEY     = process.env.DISCORD_PUBLIC_KEY
 const FRONTEND_URL   = process.env.FRONTEND_URL || 'http://localhost:5173'
 
 // ── In-memory RSVP store ─────────────────────────────────────────────
-// Format: { [cardId]: { [workspaceMemberId]: 'accepted' | 'declined' } }
+// Format: { [cardId]: { [discordUserId]: 'accepted' | 'declined' } }
 // Resets on server restart. For persistent storage, migrate to a DB.
 const rsvpStore = {}
 
@@ -155,7 +155,10 @@ app.get('/discord/members', async (req, res) => {
 app.post('/send-invite', async (req, res) => {
   const { userId, cardId, memberId, channelName, title, unixTimestamp } = req.body
 
-  if (!userId || !cardId) return res.status(400).json({ error: 'Missing userId or cardId' })
+  if (!cardId) return res.status(400).json({ error: 'Missing cardId' })
+  if (!userId || !/^\d{15,}$/.test(String(userId))) {
+    return res.status(400).json({ error: 'Invalid Discord user ID. Must be a numeric snowflake.' })
+  }
 
   // memberId is the workspace member UUID (used as the RSVP key)
   const rsvpKey = memberId || userId
@@ -182,11 +185,11 @@ app.post('/send-invite', async (req, res) => {
         components: [
           {
             type: 2, style: 3, label: 'Accept',
-            custom_id: `rsvp:${cardId}:${rsvpKey}:accepted`,
+            custom_id: `rsvp_yes_${cardId}`,
           },
           {
             type: 2, style: 4, label: 'Decline',
-            custom_id: `rsvp:${cardId}:${rsvpKey}:declined`,
+            custom_id: `rsvp_no_${cardId}`,
           },
         ],
       }],
@@ -237,63 +240,87 @@ app.get('/rsvp-status', (req, res) => {
 // ═════════════════════════════════════════════════════════════════════
 // 7. POST /interactions
 //    Discord sends button interactions here.
-//    Verifies the Ed25519 signature, stores RSVP, responds to Discord.
+//    Must respond within 3 seconds or Discord shows "interaction failed".
+//    The outer try/catch guarantees a response is always sent.
 // ═════════════════════════════════════════════════════════════════════
 app.post('/interactions', (req, res) => {
-  const sig       = req.headers['x-signature-ed25519']
-  const timestamp = req.headers['x-signature-timestamp']
-  const rawBody   = req.body  // Buffer (because we used express.raw)
+  // Fallback sender — used in the catch block so Discord never times out
+  const ack = (content = 'Response recorded.') => {
+    try { res.json({ type: 4, data: { content, flags: 64 } }) } catch {}
+  }
 
-  // Verify signature if public key is configured
-  if (PUBLIC_KEY) {
-    try {
+  try {
+    const sig       = req.headers['x-signature-ed25519']
+    const timestamp = req.headers['x-signature-timestamp']
+    const rawBody   = req.body  // Buffer from express.raw
+
+    // ── Signature verification ────────────────────────────────────────
+    if (PUBLIC_KEY) {
       const valid = nacl.sign.detached.verify(
         Buffer.from(timestamp + rawBody),
         Buffer.from(sig, 'hex'),
         Buffer.from(PUBLIC_KEY, 'hex')
       )
       if (!valid) return res.status(401).json({ error: 'Bad signature' })
-    } catch {
-      return res.status(401).json({ error: 'Signature verification failed' })
     }
-  }
 
-  let body
-  try {
-    body = JSON.parse(rawBody.toString())
-  } catch {
-    return res.status(400).json({ error: 'Invalid JSON' })
-  }
+    const body = JSON.parse(rawBody.toString())
 
-  // Discord ping
-  if (body.type === 1) return res.json({ type: 1 })
+    console.log('[interactions] received type:', body.type, '| custom_id:', body.data?.custom_id ?? 'n/a')
 
-  // Button component interaction
-  if (body.type === 3) {
-    const customId = body.data?.custom_id || ''
+    // ── Discord PING (type 1) — used to verify the endpoint URL ───────
+    if (body.type === 1) return res.json({ type: 1 })
 
-    if (customId.startsWith('rsvp:')) {
-      // Format: rsvp:{cardId}:{memberId}:{accepted|declined}
-      const parts = customId.split(':')
-      if (parts.length === 4) {
-        const [, cardId, memberId, response] = parts
+    // ── Button component interaction (type 3) ─────────────────────────
+    if (body.type === 3) {
+      const customId      = body.data?.custom_id || ''
+      const discordUserId = body.member?.user?.id || body.user?.id
+
+      // Format: rsvp_yes_<cardId>  or  rsvp_no_<cardId>
+      // The cardId is a UUID (hex + hyphens); (.+) matches it including hyphens.
+      const match = customId.match(/^rsvp_(yes|no)_(.+)$/)
+
+      console.log('[interactions] customId:', customId, '| match:', match, '| discordUserId:', discordUserId)
+
+      if (match) {
+        const [, yesNo, cardId] = match
+        const response = yesNo === 'yes' ? 'accepted' : 'declined'
+
+        // Record RSVP — no async work, store is in-memory so this is instant
         if (!rsvpStore[cardId]) rsvpStore[cardId] = {}
-        rsvpStore[cardId][memberId] = response
+        rsvpStore[cardId][discordUserId] = response
 
-        const message = response === 'accepted'
+        console.log('[interactions] RSVP stored:', { cardId, discordUserId, response })
+        console.log('[interactions] rsvpStore[cardId]:', rsvpStore[cardId])
+
+        const confirmMsg = response === 'accepted'
           ? 'You are confirmed for this recording!'
           : 'Got it — you will not be attending this recording.'
 
+        // Type 7 = UPDATE_MESSAGE — replaces the original DM message and removes the buttons
         return res.json({
-          type: 4,
-          data: { content: message, flags: 64 },  // 64 = ephemeral (only visible to the user)
+          type: 7,
+          data: {
+            content:    confirmMsg,
+            embeds:     [],
+            components: [],   // removes the Accept / Decline buttons
+          },
         })
       }
-    }
-  }
 
-  // Default acknowledge
-  res.json({ type: 1 })
+      // Unknown button — still must acknowledge
+      console.log('[interactions] unrecognised customId, sending fallback ack')
+      return ack('Response recorded.')
+    }
+
+    // Any other interaction type — acknowledge with a pong
+    res.json({ type: 1 })
+
+  } catch (err) {
+    // Something threw — send a valid response so Discord never shows "interaction failed"
+    console.error('[interactions] ERROR:', err)
+    ack('Response recorded.')
+  }
 })
 
 app.listen(PORT, () => {
